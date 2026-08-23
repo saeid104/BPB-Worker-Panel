@@ -14,9 +14,22 @@ import { renderSecretsPage } from './pages/secrets';
 const DOH_PATH = '/dns-query';
 const UPSTREAM_DOH = 'https://cloudflare-dns.com/dns-query';
 
+const dohHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'content-type',
+};
+
 async function handleDoH(request) {
+    if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: dohHeaders });
+    }
+
     if (request.method !== 'GET' && request.method !== 'POST') {
-        return new Response('Method Not Allowed', { status: 405, headers: { Allow: 'GET, POST' } });
+        return new Response('Method Not Allowed', {
+            status: 405,
+            headers: { ...dohHeaders, Allow: 'GET, POST, OPTIONS' },
+        });
     }
 
     const url = new URL(request.url);
@@ -25,9 +38,16 @@ async function handleDoH(request) {
 
     if (request.method === 'GET') {
         const dns = url.searchParams.get('dns');
-        if (!dns) return new Response('Missing dns parameter', { status: 400 });
+        if (!dns) return new Response('Missing dns parameter', { status: 400, headers: dohHeaders });
         upstream.searchParams.set('dns', dns);
     } else {
+        const contentType = request.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase();
+        if (contentType !== 'application/dns-message') {
+            return new Response('Content-Type must be application/dns-message', {
+                status: 415,
+                headers: dohHeaders,
+            });
+        }
         headers.set('Content-Type', 'application/dns-message');
     }
 
@@ -35,19 +55,22 @@ async function handleDoH(request) {
         const upstreamRequest = new Request(upstream, {
             method: request.method,
             headers,
-            body: request.method === 'POST' ? request.body : undefined
+            body: request.method === 'POST' ? request.body : undefined,
         });
         const response = await fetch(upstreamRequest);
-        const responseHeaders = new Headers(response.headers);
+        const responseHeaders = new Headers(dohHeaders);
         responseHeaders.set('Content-Type', 'application/dns-message');
         responseHeaders.set('Cache-Control', 'no-store');
         return new Response(response.body, {
             status: response.status,
             statusText: response.statusText,
-            headers: responseHeaders
+            headers: responseHeaders,
         });
     } catch {
-        return new Response('DoH upstream error', { status: 502 });
+        return new Response('DoH upstream error', {
+            status: 502,
+            headers: { ...dohHeaders, 'Content-Type': 'text/plain; charset=utf-8' },
+        });
     }
 }
 
@@ -56,8 +79,8 @@ export default {
         try {
             const url = new URL(request.url);
 
-            // DoH is intentionally handled before BPB initialization because
-            // it does not require UUID/TROJAN/KV credentials.
+            // DoH is handled before BPB initialization, so /dns-query works
+            // independently of UUID, TROJAN_PASS, or the bpb KV binding.
             if (url.pathname === DOH_PATH) return await handleDoH(request);
 
             initializeParams(request, env);
@@ -78,28 +101,28 @@ export default {
                     case `/warpsub/${globalThis.userID}`:
                         if (globalThis.client === 'clash') return await getClashWarpConfig(request, env);
                         if (globalThis.client === 'singbox' || globalThis.client === 'hiddify') return await getSingBoxWarpConfig(request, env, globalThis.client);
-                        return await getXrayWarpConfigs(request, env, globalThis.client);
+                        return await getXrayWarpConfigs(request, env);
                     case '/panel':
                         return await handlePanel(request, env);
                     case '/login':
                         return await login(request, env);
                     case '/logout':
-                        return logout();
-                    case '/panel/password':
+                        return await logout(request, env);
+                    case '/reset-password':
                         return await resetPassword(request, env);
-                    case '/my-ip':
-                        return await getMyIP(request);
                     case '/secrets':
-                        return await renderSecretsPage();
+                        return await renderSecretsPage(request, env);
                     default:
-                        return await fallback(request);
+                        return await fallback(request, env);
                 }
             }
-            return globalThis.pathName.startsWith('/tr')
-                ? await trojanOverWSHandler(request)
-                : await vlessOverWSHandler(request);
+
+            if (globalThis.pathName === `/tr/${globalThis.userID}`) {
+                return await trojanOverWSHandler(request, env);
+            }
+            return await vlessOverWSHandler(request, env);
         } catch (err) {
             return await renderErrorPage(err);
         }
-    }
+    },
 };
